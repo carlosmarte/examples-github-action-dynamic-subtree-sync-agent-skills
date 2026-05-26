@@ -1,10 +1,12 @@
 name: Sync Agent Skill (subtree)
 
 # Pulls a specific skill directory from a SOURCE registry repo (RepoA) into a
-# target path in THIS repo (RepoB, where this workflow runs) using git subtree.
+# target path in THIS repo (RepoB, where this workflow runs) using git subtree,
+# then opens a PULL REQUEST against a provided base branch instead of pushing
+# straight to it.
 #
-# It isolates just the requested subdirectory's history with `git subtree split`,
-# then `add`s it on first import or `merge`s it on subsequent syncs.
+# Source is read anonymously (the source repo must be public on your internal
+# GitHub). If it is NOT anonymously readable, use sync-skill-subtree-token.yml.
 
 on:
   # Manual run with full control over which path/branch is synced.
@@ -27,9 +29,13 @@ on:
         required: true
         default: 'main'
         type: string
+      base_branch:
+        description: 'Base branch in THIS repo to open the PR against. Blank = default branch.'
+        required: false
+        type: string
 
   # Lets RepoA trigger this automatically via a repository_dispatch webhook.
-  # client_payload may carry { source_path, target_path, source_branch }.
+  # client_payload may carry { source_path, target_path, source_branch, base_branch }.
   repository_dispatch:
     types: [skills_updated]
 
@@ -42,13 +48,14 @@ env:
   GIT_ASKPASS: ''
   GCM_INTERACTIVE: 'never'
 
-# Don't let two syncs race on the same branch.
+# Don't let two syncs race.
 concurrency:
   group: sync-skill-subtree-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: write        # push the working branch
+  pull-requests: write   # open the PR
 
 jobs:
   sync-skill-path:
@@ -62,16 +69,20 @@ jobs:
           IN_SOURCE_PATH: ${{ inputs.source_path }}
           IN_TARGET_PATH: ${{ inputs.target_path }}
           IN_SOURCE_BRANCH: ${{ inputs.source_branch }}
+          IN_BASE_BRANCH: ${{ inputs.base_branch }}
           CP_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
           CP_SOURCE_PATH: ${{ github.event.client_payload.source_path }}
           CP_TARGET_PATH: ${{ github.event.client_payload.target_path }}
           CP_SOURCE_BRANCH: ${{ github.event.client_payload.source_branch }}
+          CP_BASE_BRANCH: ${{ github.event.client_payload.base_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           source_repo="${IN_SOURCE_REPO:-${CP_SOURCE_REPO:-$SOURCE_REPO_URL}}"
           source_path="${IN_SOURCE_PATH:-${CP_SOURCE_PATH:-}}"
           target_path="${IN_TARGET_PATH:-${CP_TARGET_PATH:-}}"
           source_branch="${IN_SOURCE_BRANCH:-${CP_SOURCE_BRANCH:-main}}"
+          base_branch="${IN_BASE_BRANCH:-${CP_BASE_BRANCH:-${DEFAULT_BRANCH:-main}}}"
 
           : "${source_path:?source_path is required (input or client_payload)}"
           : "${target_path:?target_path is required (input or client_payload)}"
@@ -80,28 +91,50 @@ jobs:
           source_path="${source_path#/}"; source_path="${source_path%/}"
           target_path="${target_path#/}"; target_path="${target_path%/}"
 
+          # Unique, ref-safe working branch derived from the target path.
+          # Map dots to '-' too: git forbids a branch component starting with '.'.
+          slug="$(printf '%s' "$target_path" | tr -cs 'A-Za-z0-9_-' '-')"
+          slug="${slug#-}"; slug="${slug%-}"
+          work_branch="skills-sync/${slug}-${GITHUB_RUN_ID}"
+
           {
             echo "source_repo=$source_repo"
             echo "source_path=$source_path"
             echo "target_path=$target_path"
             echo "source_branch=$source_branch"
+            echo "base_branch=$base_branch"
+            echo "work_branch=$work_branch"
           } >> "$GITHUB_OUTPUT"
 
           echo "Sync plan: ${source_repo}#${source_branch}:${source_path} -> ${target_path}"
+          echo "PR: ${work_branch} -> ${base_branch}"
 
-      - name: Checkout target repo (RepoB)
+      - name: Checkout target repo (RepoB) at the base branch
         uses: actions/checkout@v4
         with:
+          # Open the PR against (and branch off of) the provided base branch.
+          ref: ${{ steps.cfg.outputs.base_branch }}
           # Full history is required: subtree needs to find merge bases / replay commits.
           fetch-depth: 0
           # No custom token needed: the default GITHUB_TOKEN that checkout
-          # configures is enough to push back to THIS repo (see permissions:
-          # contents: write above). The source repo is read anonymously below.
+          # configures can push the working branch and open a PR in THIS repo.
+          # The source repo is read anonymously below.
 
       - name: Configure git identity
         run: |
           git config user.name  "skill-sync-bot"
           git config user.email "skill-sync-bot@users.noreply.github.com"
+
+      - name: Create working branch
+        id: branch
+        env:
+          WORK_BRANCH: ${{ steps.cfg.outputs.work_branch }}
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git switch -c "$WORK_BRANCH"
+          echo "Created ${WORK_BRANCH} from ${base_sha}."
 
       - name: Add source registry remote
         env:
@@ -197,16 +230,43 @@ jobs:
             echo "::warning::No .md files found in ${TARGET_PATH}. Verify the source path payload."
           fi
 
-      - name: Push if anything changed
+      - name: Push working branch and open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ steps.cfg.outputs.base_branch }}
+          WORK_BRANCH: ${{ steps.cfg.outputs.work_branch }}
+          BASE_SHA: ${{ steps.branch.outputs.base_sha }}
+          SOURCE_REPO: ${{ steps.cfg.outputs.source_repo }}
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SOURCE_BRANCH: ${{ steps.cfg.outputs.source_branch }}
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
         run: |
           set -euo pipefail
-          # --squash subtree merge produces no commit when there's nothing new.
-          if git diff --quiet "origin/${GITHUB_REF_NAME}" HEAD; then
-            echo "No new commits since origin/${GITHUB_REF_NAME}; nothing to push."
-          else
-            echo "Pushing synced state to origin/${GITHUB_REF_NAME}..."
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+          # A --squash subtree op produces no commit when nothing changed.
+          if git diff --quiet "$BASE_SHA" HEAD; then
+            echo "No changes versus ${BASE_BRANCH}; nothing to sync. Skipping PR."
+            exit 0
           fi
+
+          echo "Pushing ${WORK_BRANCH}..."
+          git push origin "HEAD:${WORK_BRANCH}"
+
+          title="chore(skills): sync ${SOURCE_PATH} -> ${TARGET_PATH}"
+          body="$(printf '%s\n' \
+            "Automated skill sync via \`git subtree\`." \
+            "" \
+            "- source repo: \`${SOURCE_REPO}\`" \
+            "- source path: \`${SOURCE_PATH}\` @ \`${SOURCE_BRANCH}\`" \
+            "- target path: \`${TARGET_PATH}\`" \
+            "- base branch: \`${BASE_BRANCH}\`" \
+            "" \
+            "Generated by the Sync Agent Skill workflow (run ${GITHUB_RUN_ID}).")"
+
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$WORK_BRANCH" \
+            --title "$title" \
+            --body "$body"
 
       - name: Clean up temporary split branch
         if: always() && steps.split.outputs.split_branch != ''
