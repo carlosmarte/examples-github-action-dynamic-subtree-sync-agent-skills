@@ -54,6 +54,23 @@ jobs:
   sync-skill-path:
     runs-on: ubuntu-latest
     steps:
+      - name: Preflight — verify PAT secret is present
+        env:
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::Secret SKILL_SYNC_PAT is empty or not set in this repo."
+            echo "Cross-repo reads need a PAT — GITHUB_TOKEN can't read another repository."
+            echo "Add it under Settings -> Secrets and variables -> Actions -> New repository secret,"
+            echo "named exactly SKILL_SYNC_PAT (fine-grained: Read contents on the source repo +"
+            echo "Read/Write contents here; classic: 'repo' scope)."
+            echo "Without it, git falls back to a username prompt and fails with"
+            echo "'could not read Username ... terminal prompts disabled'."
+            exit 1
+          fi
+          echo "SKILL_SYNC_PAT is present (length ${#PAT})."
+
       - name: Resolve inputs
         id: cfg
         env:
@@ -94,9 +111,8 @@ jobs:
         with:
           # Full history is required: subtree needs to find merge bases / replay commits.
           fetch-depth: 0
-          # No custom token needed: the default GITHUB_TOKEN that checkout
-          # configures is enough to push back to THIS repo (see permissions:
-          # contents: write above). The source repo is read anonymously below.
+          # PAT with read on RepoA + write on RepoB. GITHUB_TOKEN can't read another repo.
+          token: ${{ secrets.SKILL_SYNC_PAT }}
 
       - name: Configure git identity
         run: |
@@ -106,11 +122,12 @@ jobs:
       - name: Add source registry remote
         env:
           SOURCE_REPO: ${{ steps.cfg.outputs.source_repo }}
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
         run: |
           set -euo pipefail
-          # Public repo on internal GitHub — read it anonymously, no token.
-          git remote add source-registry "https://${SOURCE_REPO}"
-          echo "Remote 'source-registry' configured (anonymous)."
+          # Token embedded in the remote URL; never echoed.
+          git remote add source-registry "https://x-access-token:${PAT}@${SOURCE_REPO}"
+          echo "Remote 'source-registry' configured."
 
       - name: Fetch source branch
         env:
@@ -119,7 +136,7 @@ jobs:
           set -euo pipefail
           echo "Fetching ${SOURCE_BRANCH} from source registry..."
           git fetch --no-tags source-registry "$SOURCE_BRANCH" \
-            || { echo "::error::Cannot fetch '${SOURCE_BRANCH}' from the source repo. A 'could not read Username' error here means the source repo is not anonymously readable (it must be public on your internal GitHub); otherwise check SOURCE_REPO_URL and the branch name."; exit 1; }
+            || { echo "::error::Cannot fetch '${SOURCE_BRANCH}' from the source repo. A 'could not read Username' error here means the PAT is invalid or lacks read access to the source repo; otherwise check SOURCE_REPO_URL and the branch name."; exit 1; }
 
       - name: Validate source path exists and is a directory
         env:
