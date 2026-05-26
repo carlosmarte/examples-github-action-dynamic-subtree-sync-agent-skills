@@ -10,7 +10,11 @@ subdirectory and nothing else, this action does a three-step orchestration:
 1. **Fetch** the source branch into RepoB's `.git` (no working-tree merge).
 2. **Split** — `git subtree split` replays only the commits touching
    `source_path` into a synthetic temporary branch containing just that
-   directory's history.
+   directory's history. `split` first does a filesystem check that the
+   `--prefix` directory exists in the *current* working tree, which RepoB's
+   checkout doesn't have — so the split runs inside a throwaway `git worktree`
+   checked out to the fetched source ref (worktrees share the object DB, so the
+   split branch is visible back in the main checkout).
 3. **Inject** — `git subtree add` (first import) or `git subtree merge`
    (subsequent syncs) grafts that branch under `target_path`, then pushes.
 

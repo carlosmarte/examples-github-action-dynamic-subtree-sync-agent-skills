@@ -164,11 +164,22 @@ jobs:
         run: |
           set -euo pipefail
           split_branch="skill-split-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          worktree="$(mktemp -d)/source-checkout"
+
+          # `git subtree split` does a filesystem check that the --prefix dir
+          # exists in the CURRENT working tree before it looks at the commit.
+          # RepoB's checkout doesn't contain SOURCE_PATH (it lives only in the
+          # fetched source ref), so run the split inside a throwaway worktree
+          # checked out to that ref. Worktrees share the object DB, so the
+          # resulting split branch is visible back in the main checkout.
+          echo "Checking out source ref into a temporary worktree..."
+          git worktree add -q --detach "$worktree" "source-registry/${SOURCE_BRANCH}"
+
           echo "Isolating history of '${SOURCE_PATH}' into ${split_branch}..."
-          git subtree split \
-            --prefix="$SOURCE_PATH" \
-            -b "$split_branch" \
-            "source-registry/${SOURCE_BRANCH}"
+          ( cd "$worktree" && git subtree split -q --prefix="$SOURCE_PATH" -b "$split_branch" )
+
+          git worktree remove --force "$worktree"
+
           echo "split_branch=$split_branch" >> "$GITHUB_OUTPUT"
 
       - name: Add or merge the skill into the target path
