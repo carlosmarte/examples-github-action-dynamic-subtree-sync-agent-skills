@@ -1,0 +1,35 @@
+# EXAMPLE — install this in the SOURCE registry repo (RepoA), NOT here.
+# Copy to RepoA's .github/workflows/notify-downstream.yml.
+#
+# When skill definitions change on main, it fires a repository_dispatch at the
+# target repo (RepoB) to kick off sync-skill-subtree.yml automatically.
+
+name: Notify downstream agents
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'   # only when skill definitions change
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch sync event to target repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          # PAT with write/dispatch access to the TARGET repo.
+          token: ${{ secrets.SKILL_SYNC_PAT }}
+          repository: your-org/target-agent-repo
+          event-type: skills_updated
+          # Forwarded to the target as github.event.client_payload.
+          client-payload: |
+            {
+              "source_path": "registry/core/communication",
+              "target_path": "agents/skills/communication",
+              "source_branch": "main"
+            }

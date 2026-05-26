@@ -1,0 +1,197 @@
+name: Sync Agent Skill (subtree)
+
+# Pulls a specific skill directory from a SOURCE registry repo (RepoA) into a
+# target path in THIS repo (RepoB, where this workflow runs) using git subtree.
+#
+# It isolates just the requested subdirectory's history with `git subtree split`,
+# then `add`s it on first import or `merge`s it on subsequent syncs.
+
+on:
+  # Manual run with full control over which path/branch is synced.
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repo (RepoA), host/owner/repo.git. Leave blank to use SOURCE_REPO_URL env.'
+        required: false
+        type: string
+      source_path:
+        description: 'Path to the skill inside RepoA (e.g. registry/core/communication)'
+        required: true
+        type: string
+      target_path:
+        description: 'Where to place the skill in THIS repo (e.g. agents/skills/communication)'
+        required: true
+        type: string
+      source_branch:
+        description: 'Branch of the source registry to pull from'
+        required: true
+        default: 'main'
+        type: string
+
+  # Lets RepoA trigger this automatically via a repository_dispatch webhook.
+  # client_payload may carry { source_path, target_path, source_branch }.
+  repository_dispatch:
+    types: [skills_updated]
+
+# Default fallback for the source repo when no input/payload is provided.
+env:
+  SOURCE_REPO_URL: 'github.com/your-org/skill-registry.git'
+
+# Don't let two syncs race on the same branch.
+concurrency:
+  group: sync-skill-subtree-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-skill-path:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: cfg
+        env:
+          # workflow_dispatch inputs OR repository_dispatch client_payload, with env fallback.
+          IN_SOURCE_REPO: ${{ inputs.source_repo }}
+          IN_SOURCE_PATH: ${{ inputs.source_path }}
+          IN_TARGET_PATH: ${{ inputs.target_path }}
+          IN_SOURCE_BRANCH: ${{ inputs.source_branch }}
+          CP_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          CP_SOURCE_PATH: ${{ github.event.client_payload.source_path }}
+          CP_TARGET_PATH: ${{ github.event.client_payload.target_path }}
+          CP_SOURCE_BRANCH: ${{ github.event.client_payload.source_branch }}
+        run: |
+          set -euo pipefail
+          source_repo="${IN_SOURCE_REPO:-${CP_SOURCE_REPO:-$SOURCE_REPO_URL}}"
+          source_path="${IN_SOURCE_PATH:-${CP_SOURCE_PATH:-}}"
+          target_path="${IN_TARGET_PATH:-${CP_TARGET_PATH:-}}"
+          source_branch="${IN_SOURCE_BRANCH:-${CP_SOURCE_BRANCH:-main}}"
+
+          : "${source_path:?source_path is required (input or client_payload)}"
+          : "${target_path:?target_path is required (input or client_payload)}"
+
+          # Strip any leading/trailing slashes so subtree prefixes are clean.
+          source_path="${source_path#/}"; source_path="${source_path%/}"
+          target_path="${target_path#/}"; target_path="${target_path%/}"
+
+          {
+            echo "source_repo=$source_repo"
+            echo "source_path=$source_path"
+            echo "target_path=$target_path"
+            echo "source_branch=$source_branch"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Sync plan: ${source_repo}#${source_branch}:${source_path} -> ${target_path}"
+
+      - name: Checkout target repo (RepoB)
+        uses: actions/checkout@v4
+        with:
+          # Full history is required: subtree needs to find merge bases / replay commits.
+          fetch-depth: 0
+          # PAT with read on RepoA + write on RepoB. GITHUB_TOKEN can't read another repo.
+          token: ${{ secrets.SKILL_SYNC_PAT }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "skill-sync-bot"
+          git config user.email "skill-sync-bot@users.noreply.github.com"
+
+      - name: Add source registry remote
+        env:
+          SOURCE_REPO: ${{ steps.cfg.outputs.source_repo }}
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          # Token embedded in the remote URL; never echoed.
+          git remote add source-registry "https://x-access-token:${PAT}@${SOURCE_REPO}"
+          echo "Remote 'source-registry' configured."
+
+      - name: Fetch source branch
+        env:
+          SOURCE_BRANCH: ${{ steps.cfg.outputs.source_branch }}
+        run: |
+          set -euo pipefail
+          echo "Fetching ${SOURCE_BRANCH} from source registry..."
+          git fetch --no-tags source-registry "$SOURCE_BRANCH" \
+            || { echo "::error::Cannot fetch '${SOURCE_BRANCH}' from source. Check PAT, URL, and branch."; exit 1; }
+
+      - name: Validate source path exists and is a directory
+        env:
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SOURCE_BRANCH: ${{ steps.cfg.outputs.source_branch }}
+        run: |
+          set -euo pipefail
+          ref="source-registry/${SOURCE_BRANCH}:${SOURCE_PATH}"
+          if ! git cat-file -e "$ref" 2>/dev/null; then
+            echo "::error::Path '${SOURCE_PATH}' not found in source-registry/${SOURCE_BRANCH}."
+            exit 1
+          fi
+          type="$(git cat-file -t "$ref")"
+          if [ "$type" != "tree" ]; then
+            echo "::error::'${SOURCE_PATH}' is a ${type}, not a directory. Provide a directory path."
+            exit 1
+          fi
+          echo "Validated: '${SOURCE_PATH}' is a directory in the source."
+
+      - name: Split source path into a temporary branch
+        id: split
+        env:
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SOURCE_BRANCH: ${{ steps.cfg.outputs.source_branch }}
+        run: |
+          set -euo pipefail
+          split_branch="skill-split-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "Isolating history of '${SOURCE_PATH}' into ${split_branch}..."
+          git subtree split \
+            --prefix="$SOURCE_PATH" \
+            -b "$split_branch" \
+            "source-registry/${SOURCE_BRANCH}"
+          echo "split_branch=$split_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Add or merge the skill into the target path
+        env:
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SPLIT_BRANCH: ${{ steps.split.outputs.split_branch }}
+        run: |
+          set -euo pipefail
+          if [ -d "$TARGET_PATH" ]; then
+            echo "Target exists -> subtree merge (update)."
+            git subtree merge \
+              --prefix="$TARGET_PATH" \
+              "$SPLIT_BRANCH" --squash \
+              -m "chore(skills): sync ${SOURCE_PATH} -> ${TARGET_PATH}"
+          else
+            echo "Target missing -> subtree add (first import)."
+            git subtree add \
+              --prefix="$TARGET_PATH" \
+              "$SPLIT_BRANCH" --squash \
+              -m "chore(skills): import ${SOURCE_PATH} -> ${TARGET_PATH}"
+          fi
+
+      - name: Validate synced skill files
+        env:
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
+        run: |
+          set -euo pipefail
+          if ls "$TARGET_PATH"/*.md >/dev/null 2>&1; then
+            echo "Validation passed: markdown skill files present in ${TARGET_PATH}."
+          else
+            echo "::warning::No .md files found in ${TARGET_PATH}. Verify the source path payload."
+          fi
+
+      - name: Push if anything changed
+        run: |
+          set -euo pipefail
+          # --squash subtree merge produces no commit when there's nothing new.
+          if git diff --quiet "origin/${GITHUB_REF_NAME}" HEAD; then
+            echo "No new commits since origin/${GITHUB_REF_NAME}; nothing to push."
+          else
+            echo "Pushing synced state to origin/${GITHUB_REF_NAME}..."
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Clean up temporary split branch
+        if: always() && steps.split.outputs.split_branch != ''
+        run: git branch -D "${{ steps.split.outputs.split_branch }}" || true
