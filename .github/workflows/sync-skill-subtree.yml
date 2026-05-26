@@ -36,6 +36,11 @@ on:
 # Default fallback for the source repo when no input/payload is provided.
 env:
   SOURCE_REPO_URL: 'github.com/your-org/skill-registry.git'
+  # Never fall back to an interactive credential prompt: any auth failure
+  # errors out immediately instead of hanging/asking for a username.
+  GIT_TERMINAL_PROMPT: '0'
+  GIT_ASKPASS: ''
+  GCM_INTERACTIVE: 'never'
 
 # Don't let two syncs race on the same branch.
 concurrency:
@@ -49,6 +54,23 @@ jobs:
   sync-skill-path:
     runs-on: ubuntu-latest
     steps:
+      - name: Preflight — verify PAT secret is present
+        env:
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::Secret SKILL_SYNC_PAT is empty or not set in this repo."
+            echo "Cross-repo reads need a PAT — GITHUB_TOKEN can't read another repository."
+            echo "Add it under Settings -> Secrets and variables -> Actions -> New repository secret,"
+            echo "named exactly SKILL_SYNC_PAT (fine-grained: Read contents on the source repo +"
+            echo "Read/Write contents here; classic: 'repo' scope)."
+            echo "Without it, git falls back to a username prompt and fails with"
+            echo "'could not read Username ... terminal prompts disabled'."
+            exit 1
+          fi
+          echo "SKILL_SYNC_PAT is present (length ${#PAT})."
+
       - name: Resolve inputs
         id: cfg
         env:
@@ -114,7 +136,7 @@ jobs:
           set -euo pipefail
           echo "Fetching ${SOURCE_BRANCH} from source registry..."
           git fetch --no-tags source-registry "$SOURCE_BRANCH" \
-            || { echo "::error::Cannot fetch '${SOURCE_BRANCH}' from source. Check PAT, URL, and branch."; exit 1; }
+            || { echo "::error::Cannot fetch '${SOURCE_BRANCH}' from the source repo. A 'could not read Username' error here means the PAT is invalid or lacks read access to the source repo; otherwise check SOURCE_REPO_URL and the branch name."; exit 1; }
 
       - name: Validate source path exists and is a directory
         env:
