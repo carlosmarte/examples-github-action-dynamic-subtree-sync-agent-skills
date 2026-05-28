@@ -1,0 +1,291 @@
+name: Push Agent Skill (subtree, token auth)
+
+# Same as push-skill-subtree.yml, but authenticates to the TARGET registry
+# with a PAT (secret SKILL_SYNC_PAT). Use this variant when the target repo
+# is in another owner/org or otherwise not writable by the default
+# GITHUB_TOKEN. Like the no-PAT variant, it opens a PULL REQUEST in the
+# target repo against a provided base branch instead of pushing straight to it.
+#
+# SKILL_SYNC_PAT scopes:
+#   fine-grained: Read contents on THIS repo (already implicit via checkout)
+#                 + Read/Write contents and Read/Write pull requests on the
+#                 TARGET repo
+#   classic:      'repo' scope
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Target repo (RepoB), host/owner/repo.git. Leave blank to use TARGET_REPO_URL env.'
+        required: false
+        type: string
+      source_path:
+        description: 'Path to the skill inside THIS repo (e.g. agents/skills/communication)'
+        required: true
+        type: string
+      target_path:
+        description: 'Where to place the skill in the target repo (e.g. registry/core/communication)'
+        required: true
+        type: string
+      source_branch:
+        description: 'Branch of THIS repo to read the skill from'
+        required: true
+        default: 'main'
+        type: string
+      target_base_branch:
+        description: 'Base branch in the TARGET repo to open the PR against. Blank = target default branch.'
+        required: false
+        type: string
+
+  # client_payload may carry { target_repo, source_path, target_path, source_branch, target_base_branch }.
+  repository_dispatch:
+    types: [skills_push]
+
+env:
+  TARGET_REPO_URL: 'github.com/your-org/skill-registry.git'
+  # Never fall back to an interactive credential prompt: any auth failure
+  # errors out immediately instead of hanging/asking for a username.
+  GIT_TERMINAL_PROMPT: '0'
+  GIT_ASKPASS: ''
+  GCM_INTERACTIVE: 'never'
+
+concurrency:
+  group: push-skill-subtree-token-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read         # source read uses GITHUB_TOKEN; target write uses PAT
+  pull-requests: read
+
+jobs:
+  push-skill-path:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preflight — verify PAT secret is present
+        env:
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::Secret SKILL_SYNC_PAT is empty or not set in this repo."
+            echo "This variant writes to a target repo outside this workflow's"
+            echo "default scope, which needs a PAT."
+            echo "Add it under Settings -> Secrets and variables -> Actions, named"
+            echo "exactly SKILL_SYNC_PAT (see the scopes in this file's header), or"
+            echo "use push-skill-subtree.yml if the target is reachable by GITHUB_TOKEN."
+            exit 1
+          fi
+          echo "SKILL_SYNC_PAT is present (length ${#PAT})."
+
+      - name: Resolve inputs
+        id: cfg
+        env:
+          IN_TARGET_REPO: ${{ inputs.target_repo }}
+          IN_SOURCE_PATH: ${{ inputs.source_path }}
+          IN_TARGET_PATH: ${{ inputs.target_path }}
+          IN_SOURCE_BRANCH: ${{ inputs.source_branch }}
+          IN_TARGET_BASE_BRANCH: ${{ inputs.target_base_branch }}
+          CP_TARGET_REPO: ${{ github.event.client_payload.target_repo }}
+          CP_SOURCE_PATH: ${{ github.event.client_payload.source_path }}
+          CP_TARGET_PATH: ${{ github.event.client_payload.target_path }}
+          CP_SOURCE_BRANCH: ${{ github.event.client_payload.source_branch }}
+          CP_TARGET_BASE_BRANCH: ${{ github.event.client_payload.target_base_branch }}
+        run: |
+          set -euo pipefail
+          target_repo="${IN_TARGET_REPO:-${CP_TARGET_REPO:-$TARGET_REPO_URL}}"
+          source_path="${IN_SOURCE_PATH:-${CP_SOURCE_PATH:-}}"
+          target_path="${IN_TARGET_PATH:-${CP_TARGET_PATH:-}}"
+          source_branch="${IN_SOURCE_BRANCH:-${CP_SOURCE_BRANCH:-main}}"
+          target_base_branch="${IN_TARGET_BASE_BRANCH:-${CP_TARGET_BASE_BRANCH:-}}"
+
+          : "${source_path:?source_path is required (input or client_payload)}"
+          : "${target_path:?target_path is required (input or client_payload)}"
+
+          source_path="${source_path#/}"; source_path="${source_path%/}"
+          target_path="${target_path#/}"; target_path="${target_path%/}"
+
+          target_nwo="$(printf '%s' "$target_repo" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+
+          # Map dots to '-' too: git forbids a branch component starting with '.'.
+          slug="$(printf '%s' "$target_path" | tr -cs 'A-Za-z0-9_-' '-')"
+          slug="${slug#-}"; slug="${slug%-}"
+          work_branch="skills-sync/${slug}-${GITHUB_RUN_ID}"
+
+          {
+            echo "target_repo=$target_repo"
+            echo "target_nwo=$target_nwo"
+            echo "source_path=$source_path"
+            echo "target_path=$target_path"
+            echo "source_branch=$source_branch"
+            echo "target_base_branch=$target_base_branch"
+            echo "work_branch=$work_branch"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Push plan: ${GITHUB_REPOSITORY}#${source_branch}:${source_path} -> ${target_repo}:${target_path}"
+          echo "PR (in target): ${work_branch} -> ${target_base_branch:-<target default>}"
+
+      - name: Checkout source repo (THIS repo) at the source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.cfg.outputs.source_branch }}
+          fetch-depth: 0
+          # Isolated under ./source so the target clone can live at ./target.
+          path: source
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "skill-sync-bot"
+          git config --global user.email "skill-sync-bot@users.noreply.github.com"
+
+      - name: Validate source path exists in this repo
+        env:
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [ ! -d "$SOURCE_PATH" ]; then
+            echo "::error::Source path '${SOURCE_PATH}' does not exist on branch '${{ steps.cfg.outputs.source_branch }}' of this repo."
+            exit 1
+          fi
+          echo "Validated: '${SOURCE_PATH}' is a directory in this repo."
+
+      - name: Split source path into a temporary branch
+        id: split
+        env:
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          split_branch="skill-split-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "Isolating history of '${SOURCE_PATH}' into ${split_branch}..."
+          git subtree split -q --prefix="$SOURCE_PATH" -b "$split_branch"
+          echo "split_branch=$split_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Clone target repo (RepoB) with PAT
+        id: clonetarget
+        env:
+          TARGET_REPO: ${{ steps.cfg.outputs.target_repo }}
+          TARGET_BASE_BRANCH: ${{ steps.cfg.outputs.target_base_branch }}
+          PAT: ${{ secrets.SKILL_SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          # Token embedded in the remote URL; never echoed.
+          if [ -n "$TARGET_BASE_BRANCH" ]; then
+            git clone --branch "$TARGET_BASE_BRANCH" \
+              "https://x-access-token:${PAT}@${TARGET_REPO}" target \
+              || { echo "::error::Cannot clone '${TARGET_REPO}' at branch '${TARGET_BASE_BRANCH}'. A 'could not read Username' / 403 here means SKILL_SYNC_PAT is invalid or lacks write access to the target repo; otherwise check TARGET_REPO_URL and the branch name."; exit 1; }
+          else
+            git clone "https://x-access-token:${PAT}@${TARGET_REPO}" target \
+              || { echo "::error::Cannot clone '${TARGET_REPO}'. Check SKILL_SYNC_PAT scopes and TARGET_REPO_URL."; exit 1; }
+          fi
+
+          # Resolve the actual base branch (default branch when input is blank).
+          cd target
+          if [ -z "$TARGET_BASE_BRANCH" ]; then
+            TARGET_BASE_BRANCH="$(git symbolic-ref --short HEAD)"
+          fi
+          echo "resolved_base_branch=$TARGET_BASE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create working branch in target clone
+        id: branch
+        env:
+          WORK_BRANCH: ${{ steps.cfg.outputs.work_branch }}
+        working-directory: target
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git switch -c "$WORK_BRANCH"
+          echo "Created ${WORK_BRANCH} from ${base_sha}."
+
+      - name: Fetch split branch from source checkout into target clone
+        env:
+          SPLIT_BRANCH: ${{ steps.split.outputs.split_branch }}
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # The two clones don't share an object DB, so transfer the split branch
+          # by fetching it from the source checkout via the local filesystem.
+          git fetch "${GITHUB_WORKSPACE}/source" "${SPLIT_BRANCH}:${SPLIT_BRANCH}"
+          echo "Fetched ${SPLIT_BRANCH} from source checkout."
+
+      - name: Add or merge the skill into the target path
+        env:
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SPLIT_BRANCH: ${{ steps.split.outputs.split_branch }}
+        working-directory: target
+        run: |
+          set -euo pipefail
+          if [ -d "$TARGET_PATH" ]; then
+            echo "Target exists -> subtree merge (update)."
+            git subtree merge \
+              --prefix="$TARGET_PATH" \
+              "$SPLIT_BRANCH" --squash \
+              -m "chore(skills): sync ${SOURCE_PATH} -> ${TARGET_PATH}"
+          else
+            echo "Target missing -> subtree add (first import)."
+            git subtree add \
+              --prefix="$TARGET_PATH" \
+              "$SPLIT_BRANCH" --squash \
+              -m "chore(skills): import ${SOURCE_PATH} -> ${TARGET_PATH}"
+          fi
+
+      - name: Validate synced skill files
+        env:
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
+        working-directory: target
+        run: |
+          set -euo pipefail
+          if ls "$TARGET_PATH"/*.md >/dev/null 2>&1; then
+            echo "Validation passed: markdown skill files present in ${TARGET_PATH}."
+          else
+            echo "::warning::No .md files found in ${TARGET_PATH}. Verify the source path payload."
+          fi
+
+      - name: Push working branch and open PR in target repo
+        env:
+          GH_TOKEN: ${{ secrets.SKILL_SYNC_PAT }}
+          BASE_BRANCH: ${{ steps.clonetarget.outputs.resolved_base_branch }}
+          WORK_BRANCH: ${{ steps.cfg.outputs.work_branch }}
+          BASE_SHA: ${{ steps.branch.outputs.base_sha }}
+          TARGET_NWO: ${{ steps.cfg.outputs.target_nwo }}
+          TARGET_REPO: ${{ steps.cfg.outputs.target_repo }}
+          SOURCE_PATH: ${{ steps.cfg.outputs.source_path }}
+          SOURCE_BRANCH: ${{ steps.cfg.outputs.source_branch }}
+          TARGET_PATH: ${{ steps.cfg.outputs.target_path }}
+        working-directory: target
+        run: |
+          set -euo pipefail
+          # A --squash subtree op produces no commit when nothing changed.
+          if git diff --quiet "$BASE_SHA" HEAD; then
+            echo "No changes versus ${BASE_BRANCH}; nothing to sync. Skipping PR."
+            exit 0
+          fi
+
+          echo "Pushing ${WORK_BRANCH} to target..."
+          git push origin "HEAD:${WORK_BRANCH}"
+
+          title="chore(skills): sync ${SOURCE_PATH} -> ${TARGET_PATH}"
+          body="$(printf '%s\n' \
+            "Automated skill sync via \`git subtree\`." \
+            "" \
+            "- source repo: \`${GITHUB_REPOSITORY}\`" \
+            "- source path: \`${SOURCE_PATH}\` @ \`${SOURCE_BRANCH}\`" \
+            "- target repo: \`${TARGET_REPO}\`" \
+            "- target path: \`${TARGET_PATH}\`" \
+            "- base branch: \`${BASE_BRANCH}\`" \
+            "" \
+            "Generated by the Push Agent Skill workflow (run ${GITHUB_RUN_ID}).")"
+
+          gh pr create \
+            -R "$TARGET_NWO" \
+            --base "$BASE_BRANCH" \
+            --head "$WORK_BRANCH" \
+            --title "$title" \
+            --body "$body"
+
+      - name: Clean up temporary split branch
+        if: always() && steps.split.outputs.split_branch != ''
+        working-directory: source
+        run: git branch -D "${{ steps.split.outputs.split_branch }}" || true
